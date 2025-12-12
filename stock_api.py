@@ -4,16 +4,28 @@ from pydantic import BaseModel, Field
 from datetime import date, datetime
 from typing import Optional, Dict, List
 from typing import Any
+import sqlite3
+from pathlib import Path
+from contextlib import contextmanager
 
 app = FastAPI(title="Stock Trading API", version="1.0.0")
 
-# 전역 상태 정의
-cash_balance: int = 10_000_000 # 초기 현금 1천만 원
-portfolio: Dict[str, Dict[str, int | str]] = {} # 종목별 보유 수량 및 평균 단가
-trade_history: List[Dict[str, int | str]] = [] # 거래 내역
+# SQLite 데이터베이스 파일 경로
+DB_FILE = Path(__file__).parent / "stock_trading.db"
 
 # 간단한 비밀번호 설정
 ACCOUNT_PASSWORD = "1234"
+
+# DB 연결 관리
+@contextmanager
+def get_db():
+    """SQLite 연결을 관리하는 컨텍스트 매니저"""
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row  # 딕셔너리처럼 접근 가능
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 class PortfolioItem(BaseModel):
     """보유 종목 정보"""
@@ -81,34 +93,53 @@ async def buy_stock(trade: TradeRequest):
     name = get_corp_name(trade.ticker)
     cost = trade.qty * price
 
-    # 잔고 확인 및 업데이트
-    global cash_balance
-    global portfolio
-    if cost > cash_balance:
-        raise HTTPException(status_code=400, detail=f"잔고가 부족합니다. 현재 잔고는 {cash_balance:,}원이며, 총 {cost:,}원이 필요합니다.")
-    cash_balance -= int(cost)
-    existing = portfolio.get(trade.ticker, {"qty": 0, "avg_price": 0.0, "name": name})
-    total_qty = existing["qty"] + trade.qty
-    avg_price = ((existing["qty"] * existing["avg_price"]) + cost) / total_qty
-    portfolio[trade.ticker] = {
-        "qty": total_qty,
-        "name": name,
-        "avg_price": int(round(avg_price, 2))
-    }
-    trade_history.append({
-        "type": "buy",
-        "name": name,
-        "ticker": trade.ticker,
-        "qty": trade.qty,
-        "price": int(round(price, 2)),
-        "avg_price": int(round(avg_price, 2)),
-        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    })
-    current_cash = cash_balance
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # 현재 잔고 확인
+        cursor.execute("SELECT cash_balance FROM accounts WHERE account_id = 1")
+        row = cursor.fetchone()
+        cash_balance = row[0]
+        
+        if cost > cash_balance:
+            raise HTTPException(status_code=400, detail=f"잔고가 부족합니다. 현재 잔고는 {cash_balance:,}원이며, 총 {cost:,}원이 필요합니다.")
+        
+        # 잔고 업데이트
+        new_balance = cash_balance - int(cost)
+        cursor.execute("UPDATE accounts SET cash_balance = ?, updated_at = CURRENT_TIMESTAMP WHERE account_id = 1", (new_balance,))
+        
+        # 포트폴리오 확인 및 업데이트
+        cursor.execute("SELECT qty, avg_price FROM portfolio WHERE account_id = 1 AND ticker = ?", (trade.ticker,))
+        existing = cursor.fetchone()
+        
+        if existing:
+            existing_qty, existing_avg = existing[0], existing[1]
+            total_qty = existing_qty + trade.qty
+            avg_price = ((existing_qty * existing_avg) + cost) / total_qty
+            cursor.execute("""
+                UPDATE portfolio 
+                SET qty = ?, avg_price = ?, name = ?, updated_at = CURRENT_TIMESTAMP 
+                WHERE account_id = 1 AND ticker = ?
+            """, (total_qty, int(round(avg_price)), name, trade.ticker))
+        else:
+            total_qty = trade.qty
+            avg_price = price
+            cursor.execute("""
+                INSERT INTO portfolio (account_id, ticker, name, qty, avg_price)
+                VALUES (1, ?, ?, ?, ?)
+            """, (trade.ticker, name, trade.qty, int(round(price))))
+        
+        # 거래 내역 저장
+        cursor.execute("""
+            INSERT INTO trade_history (account_id, trade_type, ticker, name, qty, price, avg_price)
+            VALUES (1, 'buy', ?, ?, ?, ?, ?)
+        """, (trade.ticker, name, trade.qty, int(round(price)), int(round(avg_price))))
+        
+        conn.commit()
 
     return {
         "message": f"{name} {trade.qty}주 매수 완료 (시장가 {round(price, 2)}원)",
-        "available_cash": current_cash
+        "available_cash": new_balance
     }
 
 
@@ -118,38 +149,52 @@ async def sell_stock(trade: TradeRequest):
 
     보유 수량이 부족하면 400 오류를 반환합니다. 매도 후 잔여 수량이 0이면 포트폴리오에서 삭제합니다.
     """
-    global cash_balance
-    global portfolio
-    if trade.ticker not in portfolio or portfolio[trade.ticker]["qty"] < trade.qty:
-        raise HTTPException(status_code=400, detail=f"보유한 수량이 부족합니다. 현재 보유: {portfolio.get(trade.ticker, {}).get('qty', 0)}주, 요청 수량: {trade.qty:,}주")
-
     price = get_market_price(trade.ticker)
     name = get_corp_name(trade.ticker)
     revenue = trade.qty * price
-    current_qty = portfolio[trade.ticker]["qty"]
-    current_avg_price = portfolio[trade.ticker]["avg_price"]
-    new_qty = current_qty - trade.qty
-    cash_balance += int(revenue)
-    if new_qty == 0:
-        del portfolio[trade.ticker]
-    else:
-        portfolio[trade.ticker]["qty"] = new_qty
-        portfolio[trade.ticker]["avg_price"] = current_avg_price
-
-    trade_history.append({
-        "type": "sell",
-        "name": name,
-        "ticker": trade.ticker,
-        "qty": trade.qty,
-        "price": int(round(price, 2)),
-        "avg_price": int(round(current_avg_price, 2)),
-        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    })
-    current_cash = cash_balance
+    
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # 보유 수량 확인
+        cursor.execute("SELECT qty, avg_price FROM portfolio WHERE account_id = 1 AND ticker = ?", (trade.ticker,))
+        existing = cursor.fetchone()
+        
+        if not existing or existing[0] < trade.qty:
+            current_qty = existing[0] if existing else 0
+            raise HTTPException(status_code=400, detail=f"보유한 수량이 부족합니다. 현재 보유: {current_qty}주, 요청 수량: {trade.qty:,}주")
+        
+        current_qty, current_avg_price = existing[0], existing[1]
+        new_qty = current_qty - trade.qty
+        
+        # 잔고 업데이트
+        cursor.execute("UPDATE accounts SET cash_balance = cash_balance + ?, updated_at = CURRENT_TIMESTAMP WHERE account_id = 1", (int(revenue),))
+        
+        # 포트폴리오 업데이트
+        if new_qty == 0:
+            cursor.execute("DELETE FROM portfolio WHERE account_id = 1 AND ticker = ?", (trade.ticker,))
+        else:
+            cursor.execute("""
+                UPDATE portfolio 
+                SET qty = ?, updated_at = CURRENT_TIMESTAMP 
+                WHERE account_id = 1 AND ticker = ?
+            """, (new_qty, trade.ticker))
+        
+        # 거래 내역 저장
+        cursor.execute("""
+            INSERT INTO trade_history (account_id, trade_type, ticker, name, qty, price, avg_price)
+            VALUES (1, 'sell', ?, ?, ?, ?, ?)
+        """, (trade.ticker, name, trade.qty, int(round(price)), int(round(current_avg_price))))
+        
+        # 업데이트된 잔고 조회
+        cursor.execute("SELECT cash_balance FROM accounts WHERE account_id = 1")
+        new_balance = cursor.fetchone()[0]
+        
+        conn.commit()
 
     return {
         "message": f"{name} {trade.qty}주 매도 완료 (시장가 {round(price, 2)}원)",
-        "available_cash": current_cash
+        "available_cash": new_balance
     }
 
 
@@ -162,10 +207,29 @@ async def get_balance(password: str = Header(..., alias="X-Account-Password")):
     if password != ACCOUNT_PASSWORD:
         raise HTTPException(status_code=401, detail="잘못된 비밀번호입니다.")
 
-    typed_portfolio = {ticker: PortfolioItem(**data) for ticker, data in portfolio.items()}
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # 현재 잔고 조회
+        cursor.execute("SELECT cash_balance FROM accounts WHERE account_id = 1")
+        cash_balance = cursor.fetchone()[0]
+        
+        # 포트폴리오 조회
+        cursor.execute("SELECT ticker, name, qty, avg_price FROM portfolio WHERE account_id = 1")
+        rows = cursor.fetchall()
+        
+        portfolio_dict = {}
+        for row in rows:
+            ticker, name, qty, avg_price = row
+            portfolio_dict[ticker] = PortfolioItem(
+                qty=qty,
+                name=name,
+                avg_price=avg_price
+            )
+    
     return {
         "available_cash": cash_balance,
-        "portfolio": typed_portfolio
+        "portfolio": portfolio_dict
     }
 
 
@@ -178,15 +242,38 @@ async def get_trade_history(
     if start_date and end_date and start_date > end_date:
         raise HTTPException(status_code=400, detail="start_date는 end_date보다 이후일 수 없습니다.")
 
-    filtered: List[Dict] = []
-    for trade in trade_history:
-        trade_dt = datetime.strptime(trade["datetime"], "%Y-%m-%d %H:%M:%S")
-        if start_date and trade_dt.date() < start_date:
-            continue
-        if end_date and trade_dt.date() > end_date:
-            continue
-        filtered.append(trade)
-    return filtered
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        query = "SELECT trade_type, ticker, name, qty, price, avg_price, trade_datetime FROM trade_history WHERE account_id = 1"
+        params = []
+        
+        if start_date:
+            query += " AND DATE(trade_datetime) >= ?"
+            params.append(start_date.isoformat())
+        
+        if end_date:
+            query += " AND DATE(trade_datetime) <= ?"
+            params.append(end_date.isoformat())
+        
+        query += " ORDER BY trade_datetime DESC"
+        
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        
+        result = []
+        for row in rows:
+            result.append(TradeHistoryItem(
+                type=row[0],
+                ticker=row[1],
+                name=row[2],
+                qty=row[3],
+                price=row[4],
+                avg_price=row[5],
+                datetime=row[6]
+            ))
+    
+    return result
 
 
 @app.get("/", summary="서비스 안내")
